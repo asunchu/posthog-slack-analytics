@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Automated PostHog analytics digest to Slack",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "npx tsx src/index.ts",
     "test-cron": "npx tsx -e \"import handler from './api/cron/analytics'; handler({headers:{}} as any, {status:()=>({json:console.log})} as any)\""
