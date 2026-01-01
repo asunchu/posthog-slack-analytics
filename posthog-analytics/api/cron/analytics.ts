@@ -41,16 +41,18 @@ interface ActionData {
 class PostHogClient {
   private apiKey: string;
   private projectId: string;
+  private installsProjectId: string;
   private host: string;
 
   constructor() {
     this.apiKey = process.env.POSTHOG_API_KEY!;
     this.projectId = process.env.POSTHOG_PROJECT_ID!;
+    this.installsProjectId = process.env.POSTHOG_INSTALLS_PROJECT_ID!;
     this.host = process.env.POSTHOG_HOST || 'https://us.posthog.com';
   }
 
-  private async query<T>(sql: string, name: string): Promise<QueryResult<T>> {
-    const url = `${this.host}/api/projects/${this.projectId}/query`;
+  private async query<T>(sql: string, name: string, projectId?: string): Promise<QueryResult<T>> {
+    const url = `${this.host}/api/projects/${projectId || this.projectId}/query`;
 
     const response = await fetch(url, {
       method: 'POST',
@@ -166,8 +168,16 @@ class PostHogClient {
     }));
   }
 
-  async getVisitToAppStoreFunnel(days: number = 1): Promise<{ visitors: number; appStoreClicks: number; conversionRate: number }> {
-    const query = `
+  async getVisitToInstallFunnel(days: number = 1): Promise<{
+    visitors: number;
+    appStoreClicks: number;
+    installs: number;
+    clickRate: number;
+    installRate: number;
+    overallConversion: number;
+  }> {
+    // Step 1 & 2: Visitors and App Store clicks from web project
+    const webQuery = `
       WITH
         visitors AS (
           SELECT DISTINCT distinct_id
@@ -198,10 +208,33 @@ class PostHogClient {
         (SELECT count() FROM visitors) as visitors,
         (SELECT count() FROM app_store_clickers) as app_store_clickers
     `;
-    const result = await this.query<[number, number]>(query, 'visit_to_app_store_funnel');
-    const [visitors, appStoreClicks] = result.results[0] || [0, 0];
-    const conversionRate = visitors > 0 ? Math.round((appStoreClicks / visitors) * 1000) / 10 : 0;
-    return { visitors, appStoreClicks, conversionRate };
+
+    // Step 3: Installs from mobile app project
+    const installsQuery = `
+      SELECT uniq(distinct_id) as installs
+      FROM events
+      WHERE timestamp >= now() - interval ${days} day
+        AND (
+          event = 'Application Installed'
+          OR event = 'app_installed'
+          OR event = '$identify'
+          OR event = 'install'
+        )
+    `;
+
+    const [webResult, installsResult] = await Promise.all([
+      this.query<[number, number]>(webQuery, 'web_funnel_steps'),
+      this.query<[number]>(installsQuery, 'app_installs', this.installsProjectId),
+    ]);
+
+    const [visitors, appStoreClicks] = webResult.results[0] || [0, 0];
+    const [installs] = installsResult.results[0] || [0];
+
+    const clickRate = visitors > 0 ? Math.round((appStoreClicks / visitors) * 1000) / 10 : 0;
+    const installRate = appStoreClicks > 0 ? Math.round((installs / appStoreClicks) * 1000) / 10 : 0;
+    const overallConversion = visitors > 0 ? Math.round((installs / visitors) * 1000) / 10 : 0;
+
+    return { visitors, appStoreClicks, installs, clickRate, installRate, overallConversion };
   }
 
   async getAppStoreCtaClicks(days: number = 1): Promise<{ clicks: number; uniqueUsers: number }> {
@@ -324,7 +357,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       posthog.getTopActions(days),
       posthog.getClickEvents(days),
       posthog.getAppStoreCtaClicks(days),
-      posthog.getVisitToAppStoreFunnel(days),
+      posthog.getVisitToInstallFunnel(days),
     ]);
 
     const today = new Date().toLocaleDateString('en-US', {
@@ -348,14 +381,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       blocks.divider(),
 
       // Conversion Funnel
-      blocks.section('*:funnel: Visit → App Store Funnel*'),
+      blocks.section('*:funnel: Visit → App Store → Install Funnel*'),
       blocks.section(
         `*Step 1:* Visit Site → *${formatNumber(funnel.visitors)}* users\n` +
         `${'█'.repeat(20)} 100%\n\n` +
         `*Step 2:* App Store Click → *${formatNumber(funnel.appStoreClicks)}* users\n` +
-        `${'█'.repeat(Math.max(1, Math.round(funnel.conversionRate / 5)))}${'░'.repeat(20 - Math.max(1, Math.round(funnel.conversionRate / 5)))} ${funnel.conversionRate}%`
+        `${'█'.repeat(Math.max(1, Math.round(funnel.clickRate / 5)))}${'░'.repeat(20 - Math.max(1, Math.round(funnel.clickRate / 5)))} ${funnel.clickRate}%\n\n` +
+        `*Step 3:* App Install → *${formatNumber(funnel.installs)}* users\n` +
+        `${'█'.repeat(Math.max(1, Math.round(funnel.overallConversion / 5)))}${'░'.repeat(20 - Math.max(1, Math.round(funnel.overallConversion / 5)))} ${funnel.overallConversion}%`
       ),
-      blocks.context([`Conversion rate: ${funnel.conversionRate}% | Total clicks: ${formatNumber(appStoreCta.clicks)}`]),
+      blocks.context([`Click rate: ${funnel.clickRate}% | Install rate: ${funnel.installRate}% | Overall: ${funnel.overallConversion}%`]),
       blocks.divider(),
 
       // Channels
