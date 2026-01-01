@@ -45,10 +45,20 @@ interface Influencer {
   reason: string;
 }
 
+interface PostToEngage {
+  url: string;
+  username: string;
+  caption: string;
+  likes: number;
+  comments: number;
+  suggestedComment: string;
+}
+
 interface ResearchInsights {
   trendingSummary: string;
   contentIdeas: string[];
   influencersToReach: Influencer[];
+  postsToEngage: PostToEngage[];
   keyThemes: string[];
   actionItems: string[];
 }
@@ -141,7 +151,7 @@ class ApifyClient {
       // Use Apify's Instagram Profile Scraper
       // Actor: apify/instagram-profile-scraper
       const profiles = await this.runActor<ApifyProfile>('apify~instagram-profile-scraper', {
-        usernames: usernames.slice(0, 20), // Limit to 20 profiles
+        usernames: usernames.slice(0, 50), // Increased to 50 profiles
       });
 
       return profiles;
@@ -163,9 +173,9 @@ class ApifyClient {
     // Fetch profiles
     const profiles = await this.getProfiles(Array.from(usernames));
 
-    // Filter to target range (10K-25K followers)
+    // Filter to target range (5K-50K followers for more results)
     const targetInfluencers = profiles
-      .filter(p => p.followersCount >= 10000 && p.followersCount <= 25000)
+      .filter(p => p.followersCount >= 5000 && p.followersCount <= 50000)
       .map(profile => {
         // Calculate engagement from posts we have
         const userPosts = content
@@ -202,6 +212,13 @@ async function analyzeWithClaude(
 ): Promise<ResearchInsights> {
   const anthropic = new Anthropic();
 
+  // Get top posts across all hashtags for engagement opportunities
+  const allPosts = content.flatMap(c => c.posts.map(p => ({ ...p, hashtag: c.hashtag })));
+  const topPosts = allPosts
+    .filter(p => p.caption && p.caption.length > 50) // Posts with meaningful captions
+    .sort((a, b) => (b.likesCount + b.commentsCount) - (a.likesCount + a.commentsCount))
+    .slice(0, 15);
+
   const contentSummary = content.map(c => ({
     hashtag: c.hashtag,
     postCount: c.posts.length,
@@ -216,14 +233,22 @@ async function analyzeWithClaude(
       })),
   }));
 
-  const influencerSummary = influencers.slice(0, 10).map(i => ({
+  const influencerSummary = influencers.slice(0, 15).map(i => ({
     username: i.username,
     followers: i.followers,
     bio: i.bio?.substring(0, 150),
     avgEngagement: i.engagement,
   }));
 
-  const prompt = `You are a social media researcher for VākJournal, a voice-first journaling app.
+  const postsForEngagement = topPosts.slice(0, 10).map(p => ({
+    username: p.ownerUsername,
+    caption: p.caption?.substring(0, 400),
+    likes: p.likesCount,
+    comments: p.commentsCount,
+    url: p.url,
+  }));
+
+  const prompt = `You are a social media strategist for VākJournal, a voice-first journaling app.
 
 **About VākJournal:**
 - Voice-first journaling app for founders, creators, and leaders
@@ -236,35 +261,46 @@ async function analyzeWithClaude(
 ## Trending Content by Hashtag:
 ${JSON.stringify(contentSummary, null, 2)}
 
-## Potential Influencers (10K-25K followers):
+## Potential Influencers (5K-50K followers):
 ${JSON.stringify(influencerSummary, null, 2)}
+
+## Top Posts to Potentially Engage With:
+${JSON.stringify(postsForEngagement, null, 2)}
 
 Respond with this exact JSON structure:
 {
   "trendingSummary": "2-3 sentence summary of current trends in journaling/personal growth content on Instagram",
   "contentIdeas": [
-    "5 specific Instagram content ideas for VākJournal based on what's trending - be specific about format (Reel, Carousel, Story) and hook"
+    "5 specific Instagram content ideas for VākJournal - be specific about format (Reel, Carousel, Story) and hook"
   ],
   "keyThemes": [
     "5 themes/topics resonating with the journaling audience right now"
   ],
   "influencerAnalysis": [
     {
-      "username": "exact_username",
+      "username": "exact_username_from_list",
       "relevanceScore": 8,
-      "reason": "Specific reason why they'd be a good VākJournal partner based on their bio/content"
+      "reason": "Specific reason why they'd be a good VākJournal partner"
+    }
+  ],
+  "postsToEngage": [
+    {
+      "username": "exact_username_from_posts",
+      "suggestedComment": "A thoughtful, value-adding comment (not salesy) that positions VākJournal founder as a thought leader. 1-2 sentences max."
     }
   ],
   "actionItems": [
-    "5 specific actions to take this week - be concrete and actionable"
+    "5 specific actions to take this week"
   ]
 }
 
-Be specific and actionable. Focus on insights that help VākJournal grow.`;
+For influencerAnalysis: Analyze ALL influencers provided and rank them.
+For postsToEngage: Pick 5-7 best posts and write authentic, non-promotional comments that add value to the conversation.
+Be specific and actionable.`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 2500,
+    max_tokens: 3500,
     messages: [{ role: 'user', content: prompt }],
   });
 
@@ -290,10 +326,28 @@ Be specific and actionable. Focus on insights that help VākJournal grow.`;
     };
   }).sort((a, b) => b.relevanceScore - a.relevanceScore);
 
+  // Build posts to engage list with suggested comments
+  const postsToEngage: PostToEngage[] = (analysis.postsToEngage || [])
+    .map((pe: any) => {
+      const post = topPosts.find(p => p.ownerUsername?.toLowerCase() === pe.username?.toLowerCase());
+      if (!post) return null;
+      return {
+        url: post.url,
+        username: post.ownerUsername,
+        caption: post.caption?.substring(0, 150) + '...',
+        likes: post.likesCount,
+        comments: post.commentsCount,
+        suggestedComment: pe.suggestedComment,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 7);
+
   return {
     trendingSummary: analysis.trendingSummary || 'No trends identified.',
     contentIdeas: analysis.contentIdeas || [],
-    influencersToReach: enrichedInfluencers.slice(0, 5),
+    influencersToReach: enrichedInfluencers.slice(0, 10), // Increased to 10
+    postsToEngage,
     keyThemes: analysis.keyThemes || [],
     actionItems: analysis.actionItems || [],
   };
@@ -346,14 +400,27 @@ function formatSlackReport(insights: ResearchInsights, hashtagsSearched: string[
     blocks.divider(),
 
     // Influencers
-    blocks.section('*🤝 Influencers to Reach Out*'),
+    blocks.section('*🤝 Influencers to Reach Out (5K-50K)*'),
     blocks.section(
       insights.influencersToReach.length > 0
         ? insights.influencersToReach.map(inf =>
             `*<${inf.profileUrl}|@${inf.username}>* · ${(inf.followers / 1000).toFixed(1)}K followers\n` +
             `${'⭐'.repeat(Math.min(Math.round(inf.relevanceScore / 2), 5))} ${inf.reason}`
           ).join('\n\n')
-        : '_No influencers found in 10K-25K range_'
+        : '_No influencers found in target range_'
+    ),
+    blocks.divider(),
+
+    // Posts to Engage With
+    blocks.section('*💬 Posts to Engage With*'),
+    blocks.section(
+      insights.postsToEngage.length > 0
+        ? insights.postsToEngage.map(post =>
+            `*<${post.url}|@${post.username}>* (${post.likes} ❤️ ${post.comments} 💬)\n` +
+            `_"${post.caption}"_\n` +
+            `➡️ *Comment:* "${post.suggestedComment}"`
+          ).join('\n\n')
+        : '_No posts to engage with found_'
     ),
     blocks.divider(),
 
