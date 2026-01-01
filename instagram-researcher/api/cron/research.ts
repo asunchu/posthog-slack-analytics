@@ -3,35 +3,36 @@ import Anthropic from '@anthropic-ai/sdk';
 
 // ============ Types ============
 
-interface InstagramMedia {
+interface ApifyPost {
   id: string;
+  shortCode: string;
   caption?: string;
-  media_type: string;
-  permalink: string;
+  url: string;
   timestamp: string;
-  like_count?: number;
-  comments_count?: number;
-  username?: string;
-  owner?: {
-    id: string;
-    username: string;
-  };
+  likesCount: number;
+  commentsCount: number;
+  ownerUsername: string;
+  ownerId: string;
+  hashtags?: string[];
+  type: string;
 }
 
-interface InstagramUser {
+interface ApifyProfile {
   id: string;
   username: string;
-  name?: string;
+  fullName?: string;
   biography?: string;
-  followers_count?: number;
-  media_count?: number;
-  profile_picture_url?: string;
+  followersCount: number;
+  followsCount: number;
+  postsCount: number;
+  profilePicUrl?: string;
+  isVerified: boolean;
+  externalUrl?: string;
 }
 
 interface TrendingContent {
   hashtag: string;
-  topPosts: InstagramMedia[];
-  recentPosts: InstagramMedia[];
+  posts: ApifyPost[];
 }
 
 interface Influencer {
@@ -39,7 +40,7 @@ interface Influencer {
   followers: number;
   bio?: string;
   profileUrl: string;
-  recentEngagement: number;
+  engagement: number;
   relevanceScore: number;
   reason: string;
 }
@@ -52,144 +53,144 @@ interface ResearchInsights {
   actionItems: string[];
 }
 
-// ============ Instagram Client ============
+// ============ Apify Client ============
 
-class InstagramClient {
-  private accessToken: string;
-  private businessAccountId: string;
-  private baseUrl = 'https://graph.facebook.com/v18.0';
+class ApifyClient {
+  private apiToken: string;
+  private baseUrl = 'https://api.apify.com/v2';
 
   constructor() {
-    this.accessToken = process.env.INSTAGRAM_ACCESS_TOKEN!;
-    this.businessAccountId = process.env.INSTAGRAM_BUSINESS_ACCOUNT_ID!;
+    this.apiToken = process.env.APIFY_API_TOKEN!;
   }
 
-  private async fetch<T>(endpoint: string, params: Record<string, string> = {}): Promise<T> {
-    const url = new URL(`${this.baseUrl}${endpoint}`);
-    url.searchParams.set('access_token', this.accessToken);
-    Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+  private async runActor<T>(actorId: string, input: Record<string, any>): Promise<T[]> {
+    // Start the actor run
+    const runResponse = await fetch(
+      `${this.baseUrl}/acts/${actorId}/runs?token=${this.apiToken}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+      }
+    );
 
-    const response = await fetch(url.toString());
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Instagram API error: ${response.status} - ${error}`);
+    if (!runResponse.ok) {
+      throw new Error(`Apify run error: ${runResponse.status}`);
     }
-    return response.json();
+
+    const runData = await runResponse.json();
+    const runId = runData.data.id;
+
+    // Wait for completion (poll every 5 seconds, max 2 minutes)
+    let status = runData.data.status;
+    let attempts = 0;
+    while (status !== 'SUCCEEDED' && status !== 'FAILED' && attempts < 24) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      const statusResponse = await fetch(
+        `${this.baseUrl}/actor-runs/${runId}?token=${this.apiToken}`
+      );
+      const statusData = await statusResponse.json();
+      status = statusData.data.status;
+      attempts++;
+    }
+
+    if (status !== 'SUCCEEDED') {
+      throw new Error(`Apify run failed with status: ${status}`);
+    }
+
+    // Get results from dataset
+    const datasetId = runData.data.defaultDatasetId;
+    const resultsResponse = await fetch(
+      `${this.baseUrl}/datasets/${datasetId}/items?token=${this.apiToken}`
+    );
+
+    if (!resultsResponse.ok) {
+      throw new Error(`Apify results error: ${resultsResponse.status}`);
+    }
+
+    return resultsResponse.json();
   }
 
-  async searchHashtag(hashtag: string): Promise<{ id: string }> {
-    return this.fetch(`/ig_hashtag_search`, {
-      user_id: this.businessAccountId,
-      q: hashtag,
-    });
-  }
-
-  async getHashtagMedia(hashtagId: string, type: 'top' | 'recent' = 'top'): Promise<{ data: InstagramMedia[] }> {
-    const edge = type === 'top' ? 'top_media' : 'recent_media';
-    return this.fetch(`/${hashtagId}/${edge}`, {
-      user_id: this.businessAccountId,
-      fields: 'id,caption,media_type,permalink,timestamp,like_count,comments_count',
-    });
-  }
-
-  async getMediaDetails(mediaId: string): Promise<InstagramMedia> {
-    return this.fetch(`/${mediaId}`, {
-      fields: 'id,caption,media_type,permalink,timestamp,like_count,comments_count,owner{id,username}',
-    });
-  }
-
-  async getUserProfile(userId: string): Promise<InstagramUser> {
-    return this.fetch(`/${userId}`, {
-      fields: 'id,username,name,biography,followers_count,media_count,profile_picture_url',
-    });
-  }
-
-  async getTrendingContent(hashtags: string[]): Promise<TrendingContent[]> {
+  async searchHashtags(hashtags: string[], postsPerHashtag: number = 20): Promise<TrendingContent[]> {
     const results: TrendingContent[] = [];
 
-    for (const hashtag of hashtags.slice(0, 5)) { // Limit to 5 hashtags per run
+    // Use Apify's Instagram Hashtag Scraper
+    // Actor: apify/instagram-hashtag-scraper
+    for (const hashtag of hashtags) {
       try {
-        const searchResult = await this.searchHashtag(hashtag);
-        const hashtagId = (searchResult as any).data?.[0]?.id;
-
-        if (!hashtagId) continue;
-
-        const [topMedia, recentMedia] = await Promise.all([
-          this.getHashtagMedia(hashtagId, 'top'),
-          this.getHashtagMedia(hashtagId, 'recent'),
-        ]);
-
-        // Enrich with owner details
-        const enrichedTop = await Promise.all(
-          topMedia.data.slice(0, 5).map(async (media) => {
-            try {
-              return await this.getMediaDetails(media.id);
-            } catch {
-              return media;
-            }
-          })
-        );
-
-        results.push({
-          hashtag,
-          topPosts: enrichedTop,
-          recentPosts: recentMedia.data.slice(0, 10),
+        const posts = await this.runActor<ApifyPost>('apify~instagram-hashtag-scraper', {
+          hashtags: [hashtag],
+          resultsLimit: postsPerHashtag,
+          resultsType: 'posts',
         });
 
-        // Rate limiting pause
-        await new Promise(resolve => setTimeout(resolve, 500));
+        results.push({ hashtag, posts });
+        console.log(`Fetched ${posts.length} posts for #${hashtag}`);
       } catch (error) {
-        console.error(`Error fetching hashtag ${hashtag}:`, error);
+        console.error(`Error fetching #${hashtag}:`, error);
       }
     }
 
     return results;
   }
 
-  async discoverInfluencers(content: TrendingContent[]): Promise<Influencer[]> {
-    const userIds = new Set<string>();
-    const influencers: Influencer[] = [];
+  async getProfiles(usernames: string[]): Promise<ApifyProfile[]> {
+    if (usernames.length === 0) return [];
 
-    // Collect unique user IDs from content
-    for (const { topPosts, recentPosts } of content) {
-      [...topPosts, ...recentPosts].forEach(post => {
-        if (post.owner?.id) userIds.add(post.owner.id);
+    try {
+      // Use Apify's Instagram Profile Scraper
+      // Actor: apify/instagram-profile-scraper
+      const profiles = await this.runActor<ApifyProfile>('apify~instagram-profile-scraper', {
+        usernames: usernames.slice(0, 20), // Limit to 20 profiles
       });
+
+      return profiles;
+    } catch (error) {
+      console.error('Error fetching profiles:', error);
+      return [];
     }
+  }
 
-    // Fetch user profiles and filter by follower count (10K-25K)
-    for (const userId of Array.from(userIds).slice(0, 20)) {
-      try {
-        const profile = await this.getUserProfile(userId);
-        const followers = profile.followers_count || 0;
+  async discoverInfluencers(content: TrendingContent[]): Promise<Influencer[]> {
+    // Extract unique usernames from posts
+    const usernames = new Set<string>();
+    content.forEach(({ posts }) => {
+      posts.forEach(post => {
+        if (post.ownerUsername) usernames.add(post.ownerUsername);
+      });
+    });
 
-        if (followers >= 10000 && followers <= 25000) {
-          // Calculate engagement from their recent posts in our data
-          const userPosts = content
-            .flatMap(c => [...c.topPosts, ...c.recentPosts])
-            .filter(p => p.owner?.id === userId);
+    // Fetch profiles
+    const profiles = await this.getProfiles(Array.from(usernames));
 
-          const avgEngagement = userPosts.reduce((sum, p) =>
-            sum + (p.like_count || 0) + (p.comments_count || 0), 0) / Math.max(userPosts.length, 1);
+    // Filter to target range (10K-25K followers)
+    const targetInfluencers = profiles
+      .filter(p => p.followersCount >= 10000 && p.followersCount <= 25000)
+      .map(profile => {
+        // Calculate engagement from posts we have
+        const userPosts = content
+          .flatMap(c => c.posts)
+          .filter(p => p.ownerUsername === profile.username);
 
-          influencers.push({
-            username: profile.username,
-            followers,
-            bio: profile.biography,
-            profileUrl: `https://instagram.com/${profile.username}`,
-            recentEngagement: Math.round(avgEngagement),
-            relevanceScore: 0, // Will be set by AI
-            reason: '', // Will be set by AI
-          });
-        }
+        const totalEngagement = userPosts.reduce(
+          (sum, p) => sum + p.likesCount + p.commentsCount, 0
+        );
+        const avgEngagement = userPosts.length > 0
+          ? totalEngagement / userPosts.length
+          : 0;
 
-        await new Promise(resolve => setTimeout(resolve, 200));
-      } catch (error) {
-        console.error(`Error fetching user ${userId}:`, error);
-      }
-    }
+        return {
+          username: profile.username,
+          followers: profile.followersCount,
+          bio: profile.biography,
+          profileUrl: `https://instagram.com/${profile.username}`,
+          engagement: Math.round(avgEngagement),
+          relevanceScore: 0,
+          reason: '',
+        };
+      });
 
-    return influencers;
+    return targetInfluencers;
   }
 }
 
@@ -203,25 +204,34 @@ async function analyzeWithClaude(
 
   const contentSummary = content.map(c => ({
     hashtag: c.hashtag,
-    topCaptions: c.topPosts.slice(0, 3).map(p => p.caption?.substring(0, 200)),
-    recentCaptions: c.recentPosts.slice(0, 5).map(p => p.caption?.substring(0, 200)),
+    postCount: c.posts.length,
+    topCaptions: c.posts
+      .sort((a, b) => (b.likesCount + b.commentsCount) - (a.likesCount + a.commentsCount))
+      .slice(0, 5)
+      .map(p => ({
+        caption: p.caption?.substring(0, 300),
+        likes: p.likesCount,
+        comments: p.commentsCount,
+        username: p.ownerUsername,
+      })),
   }));
 
-  const influencerSummary = influencers.map(i => ({
+  const influencerSummary = influencers.slice(0, 10).map(i => ({
     username: i.username,
     followers: i.followers,
     bio: i.bio?.substring(0, 150),
-    engagement: i.recentEngagement,
+    avgEngagement: i.engagement,
   }));
 
-  const prompt = `You are a social media researcher for VākJournal, a voice-first journaling app for founders, creators, and leaders who "think out loud."
+  const prompt = `You are a social media researcher for VākJournal, a voice-first journaling app.
 
-App Context:
-- VākJournal transforms voice thoughts into structured insights and growth moments
-- Target audience: Founders, creators, leaders, executives
-- Key themes: Voice journaling, mental clarity, personal growth, reflection, productivity
+**About VākJournal:**
+- Voice-first journaling app for founders, creators, and leaders
+- Users speak their thoughts, AI transforms them into structured insights
+- Target audience: Founders, executives, creative professionals
+- Key value props: Think out loud, mental clarity, personal growth, reflection
 
-Analyze this Instagram research data and provide insights:
+**Your task:** Analyze this Instagram research data and provide actionable insights.
 
 ## Trending Content by Hashtag:
 ${JSON.stringify(contentSummary, null, 2)}
@@ -229,32 +239,32 @@ ${JSON.stringify(contentSummary, null, 2)}
 ## Potential Influencers (10K-25K followers):
 ${JSON.stringify(influencerSummary, null, 2)}
 
-Provide your analysis in this exact JSON format:
+Respond with this exact JSON structure:
 {
-  "trendingSummary": "2-3 sentence summary of what's trending in journaling/personal growth content",
+  "trendingSummary": "2-3 sentence summary of current trends in journaling/personal growth content on Instagram",
   "contentIdeas": [
-    "5 specific content ideas for VākJournal's Instagram, based on trends"
+    "5 specific Instagram content ideas for VākJournal based on what's trending - be specific about format (Reel, Carousel, Story) and hook"
   ],
   "keyThemes": [
-    "Top 5 themes/topics that are resonating with audiences"
+    "5 themes/topics resonating with the journaling audience right now"
   ],
   "influencerAnalysis": [
     {
-      "username": "username",
-      "relevanceScore": 1-10,
-      "reason": "Why they're a good fit for VākJournal partnership"
+      "username": "exact_username",
+      "relevanceScore": 8,
+      "reason": "Specific reason why they'd be a good VākJournal partner based on their bio/content"
     }
   ],
   "actionItems": [
-    "3-5 specific actions to take this week based on this research"
+    "5 specific actions to take this week - be concrete and actionable"
   ]
 }
 
-Focus on actionable insights for VākJournal. Be specific about why each influencer would be a good fit.`;
+Be specific and actionable. Focus on insights that help VākJournal grow.`;
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
-    max_tokens: 2000,
+    max_tokens: 2500,
     messages: [{ role: 'user', content: prompt }],
   });
 
@@ -271,17 +281,17 @@ Focus on actionable insights for VākJournal. Be specific about why each influen
   // Merge AI analysis with influencer data
   const enrichedInfluencers = influencers.map(inf => {
     const aiAnalysis = analysis.influencerAnalysis?.find(
-      (a: any) => a.username.toLowerCase() === inf.username.toLowerCase()
+      (a: any) => a.username?.toLowerCase() === inf.username?.toLowerCase()
     );
     return {
       ...inf,
       relevanceScore: aiAnalysis?.relevanceScore || 5,
-      reason: aiAnalysis?.reason || 'Active in journaling/productivity space',
+      reason: aiAnalysis?.reason || 'Active in journaling/productivity niche',
     };
   }).sort((a, b) => b.relevanceScore - a.relevanceScore);
 
   return {
-    trendingSummary: analysis.trendingSummary,
+    trendingSummary: analysis.trendingSummary || 'No trends identified.',
     contentIdeas: analysis.contentIdeas || [],
     influencersToReach: enrichedInfluencers.slice(0, 5),
     keyThemes: analysis.keyThemes || [],
@@ -294,7 +304,6 @@ Focus on actionable insights for VākJournal. Be specific about why each influen
 interface SlackBlock {
   type: string;
   text?: { type: string; text: string; emoji?: boolean };
-  fields?: Array<{ type: string; text: string }>;
   elements?: Array<{ type: string; text: string }>;
 }
 
@@ -311,14 +320,14 @@ const blocks = {
   }),
 };
 
-function formatSlackReport(insights: ResearchInsights): SlackBlock[] {
+function formatSlackReport(insights: ResearchInsights, hashtagsSearched: string[]): SlackBlock[] {
   const today = new Date().toLocaleDateString('en-US', {
     weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
   });
 
   return [
     blocks.header('📸 Instagram Research Report'),
-    blocks.context([`VākJournal Content Research | ${today}`]),
+    blocks.context([`VākJournal | ${today} | Hashtags: ${hashtagsSearched.map(h => `#${h}`).join(', ')}`]),
     blocks.divider(),
 
     // Trending Summary
@@ -332,28 +341,28 @@ function formatSlackReport(insights: ResearchInsights): SlackBlock[] {
     blocks.divider(),
 
     // Content Ideas
-    blocks.section('*💡 Content Ideas for VākJournal*'),
-    blocks.section(insights.contentIdeas.map((idea, i) => `${i + 1}. ${idea}`).join('\n\n')),
+    blocks.section('*💡 Content Ideas*'),
+    blocks.section(insights.contentIdeas.map((idea, i) => `*${i + 1}.* ${idea}`).join('\n\n')),
     blocks.divider(),
 
-    // Influencers to Reach
-    blocks.section('*🤝 Influencers to Reach Out (10K-25K)*'),
+    // Influencers
+    blocks.section('*🤝 Influencers to Reach Out*'),
     blocks.section(
       insights.influencersToReach.length > 0
         ? insights.influencersToReach.map(inf =>
-            `*<${inf.profileUrl}|@${inf.username}>* (${(inf.followers / 1000).toFixed(1)}K)\n` +
-            `Score: ${'⭐'.repeat(Math.min(inf.relevanceScore, 5))} | ${inf.reason}`
+            `*<${inf.profileUrl}|@${inf.username}>* · ${(inf.followers / 1000).toFixed(1)}K followers\n` +
+            `${'⭐'.repeat(Math.min(Math.round(inf.relevanceScore / 2), 5))} ${inf.reason}`
           ).join('\n\n')
-        : '_No influencers found in target range_'
+        : '_No influencers found in 10K-25K range_'
     ),
     blocks.divider(),
 
     // Action Items
-    blocks.section('*✅ This Week\'s Action Items*'),
+    blocks.section('*✅ Action Items*'),
     blocks.section(insights.actionItems.map(item => `• ${item}`).join('\n')),
     blocks.divider(),
 
-    blocks.context(['🤖 Generated by VākJournal Instagram Research Agent']),
+    blocks.context(['🤖 VākJournal Instagram Research Agent']),
   ];
 }
 
@@ -380,28 +389,41 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     console.log('Starting Instagram research...');
 
-    const instagram = new InstagramClient();
-    const hashtags = (process.env.HASHTAGS || 'journaling,bulletjournal,voicejournal,morningpages,journalprompts').split(',');
+    const apify = new ApifyClient();
+    const hashtags = (process.env.HASHTAGS || 'journaling,bulletjournal,voicenotes,morningpages,journalprompts').split(',');
 
-    // Step 1: Fetch trending content
-    console.log('Fetching trending content...');
-    const trendingContent = await instagram.getTrendingContent(hashtags);
+    // Step 1: Search hashtags
+    console.log(`Searching hashtags: ${hashtags.join(', ')}`);
+    const trendingContent = await apify.searchHashtags(hashtags, 15);
+
+    if (trendingContent.length === 0) {
+      throw new Error('No content fetched from hashtags');
+    }
 
     // Step 2: Discover influencers
     console.log('Discovering influencers...');
-    const influencers = await instagram.discoverInfluencers(trendingContent);
+    const influencers = await apify.discoverInfluencers(trendingContent);
+    console.log(`Found ${influencers.length} influencers in 10K-25K range`);
 
     // Step 3: AI analysis
     console.log('Analyzing with Claude...');
     const insights = await analyzeWithClaude(trendingContent, influencers);
 
     // Step 4: Send to Slack
-    console.log('Sending report to Slack...');
-    const slackBlocks = formatSlackReport(insights);
+    console.log('Sending to Slack...');
+    const slackBlocks = formatSlackReport(insights, hashtags);
     await sendToSlack(slackBlocks);
 
     console.log('Research complete!');
-    return res.status(200).json({ success: true, message: 'Research report sent to Slack' });
+    return res.status(200).json({
+      success: true,
+      message: 'Research report sent to Slack',
+      stats: {
+        hashtagsSearched: hashtags.length,
+        postsAnalyzed: trendingContent.reduce((sum, c) => sum + c.posts.length, 0),
+        influencersFound: influencers.length,
+      },
+    });
   } catch (error) {
     console.error('Error:', error);
     return res.status(500).json({ error: error instanceof Error ? error.message : 'Unknown error' });
