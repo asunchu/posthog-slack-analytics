@@ -166,6 +166,44 @@ class PostHogClient {
     }));
   }
 
+  async getVisitToAppStoreFunnel(days: number = 1): Promise<{ visitors: number; appStoreClicks: number; conversionRate: number }> {
+    const query = `
+      WITH
+        visitors AS (
+          SELECT DISTINCT distinct_id
+          FROM events
+          WHERE event = '$pageview'
+            AND timestamp >= now() - interval ${days} day
+        ),
+        app_store_clickers AS (
+          SELECT DISTINCT distinct_id
+          FROM events
+          WHERE timestamp >= now() - interval ${days} day
+            AND (
+              event = 'app_store_click'
+              OR event = 'app_store_cta_click'
+              OR (
+                event = '$autocapture'
+                AND (properties.$event_type = 'click' OR properties.event_type = 'click')
+                AND (
+                  lower(coalesce(properties.$el_text, properties.element_text, '')) LIKE '%app store%'
+                  OR lower(coalesce(properties.$el_text, properties.element_text, '')) LIKE '%download%app%'
+                  OR lower(coalesce(properties.href, '')) LIKE '%apps.apple.com%'
+                  OR lower(coalesce(properties.href, '')) LIKE '%play.google.com%'
+                )
+              )
+            )
+        )
+      SELECT
+        (SELECT count() FROM visitors) as visitors,
+        (SELECT count() FROM app_store_clickers) as app_store_clickers
+    `;
+    const result = await this.query<[number, number]>(query, 'visit_to_app_store_funnel');
+    const [visitors, appStoreClicks] = result.results[0] || [0, 0];
+    const conversionRate = visitors > 0 ? Math.round((appStoreClicks / visitors) * 1000) / 10 : 0;
+    return { visitors, appStoreClicks, conversionRate };
+  }
+
   async getAppStoreCtaClicks(days: number = 1): Promise<{ clicks: number; uniqueUsers: number }> {
     const query = `
       SELECT count() as clicks, uniq(distinct_id) as unique_users
@@ -278,7 +316,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const posthog = new PostHogClient();
 
     console.log('Fetching analytics data...');
-    const [traffic, channels, referrers, topPages, actions, clicks, appStoreCta] = await Promise.all([
+    const [traffic, channels, referrers, topPages, actions, clicks, appStoreCta, funnel] = await Promise.all([
       posthog.getTrafficOverview(days),
       posthog.getChannels(days),
       posthog.getTopReferrers(days),
@@ -286,6 +324,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       posthog.getTopActions(days),
       posthog.getClickEvents(days),
       posthog.getAppStoreCtaClicks(days),
+      posthog.getVisitToAppStoreFunnel(days),
     ]);
 
     const today = new Date().toLocaleDateString('en-US', {
@@ -308,12 +347,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       blocks.context([`Avg. session duration: ${formatDuration(traffic.avgSessionDuration)}`]),
       blocks.divider(),
 
-      // App Store CTA
-      blocks.section('*:iphone: App Store CTA*'),
-      blocks.fields([
-        `*Clicks*\n${formatNumber(appStoreCta.clicks)}`,
-        `*Unique Users*\n${formatNumber(appStoreCta.uniqueUsers)}`,
-      ]),
+      // Conversion Funnel
+      blocks.section('*:funnel: Visit → App Store Funnel*'),
+      blocks.section(
+        `*Step 1:* Visit Site → *${formatNumber(funnel.visitors)}* users\n` +
+        `${'█'.repeat(20)} 100%\n\n` +
+        `*Step 2:* App Store Click → *${formatNumber(funnel.appStoreClicks)}* users\n` +
+        `${'█'.repeat(Math.max(1, Math.round(funnel.conversionRate / 5)))}${'░'.repeat(20 - Math.max(1, Math.round(funnel.conversionRate / 5)))} ${funnel.conversionRate}%`
+      ),
+      blocks.context([`Conversion rate: ${funnel.conversionRate}% | Total clicks: ${formatNumber(appStoreCta.clicks)}`]),
       blocks.divider(),
 
       // Channels
