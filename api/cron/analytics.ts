@@ -166,6 +166,33 @@ class PostHogClient {
     }));
   }
 
+  async getAppStoreCtaClicks(days: number = 1): Promise<{ clicks: number; uniqueUsers: number }> {
+    const query = `
+      SELECT count() as clicks, uniq(distinct_id) as unique_users
+      FROM events
+      WHERE timestamp >= now() - interval ${days} day
+        AND (
+          -- Custom event for App Store clicks
+          event = 'app_store_click'
+          OR event = 'app_store_cta_click'
+          -- Or autocaptured clicks on App Store buttons/links
+          OR (
+            event = '$autocapture'
+            AND (properties.$event_type = 'click' OR properties.event_type = 'click')
+            AND (
+              lower(coalesce(properties.$el_text, properties.element_text, '')) LIKE '%app store%'
+              OR lower(coalesce(properties.$el_text, properties.element_text, '')) LIKE '%download%app%'
+              OR lower(coalesce(properties.href, '')) LIKE '%apps.apple.com%'
+              OR lower(coalesce(properties.href, '')) LIKE '%play.google.com%'
+            )
+          )
+        )
+    `;
+    const result = await this.query<[number, number]>(query, 'app_store_cta_clicks');
+    const [clicks, uniqueUsers] = result.results[0] || [0, 0];
+    return { clicks, uniqueUsers };
+  }
+
   private extractDomain(url: string): string {
     try {
       return new URL(url).hostname.replace('www.', '');
@@ -251,13 +278,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const posthog = new PostHogClient();
 
     console.log('Fetching analytics data...');
-    const [traffic, channels, referrers, topPages, actions, clicks] = await Promise.all([
+    const [traffic, channels, referrers, topPages, actions, clicks, appStoreCta] = await Promise.all([
       posthog.getTrafficOverview(days),
       posthog.getChannels(days),
       posthog.getTopReferrers(days),
       posthog.getTopPages(days),
       posthog.getTopActions(days),
       posthog.getClickEvents(days),
+      posthog.getAppStoreCtaClicks(days),
     ]);
 
     const today = new Date().toLocaleDateString('en-US', {
@@ -278,6 +306,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         `*Bounce Rate*\n${traffic.bounceRate}%`,
       ]),
       blocks.context([`Avg. session duration: ${formatDuration(traffic.avgSessionDuration)}`]),
+      blocks.divider(),
+
+      // App Store CTA
+      blocks.section('*:iphone: App Store CTA*'),
+      blocks.fields([
+        `*Clicks*\n${formatNumber(appStoreCta.clicks)}`,
+        `*Unique Users*\n${formatNumber(appStoreCta.uniqueUsers)}`,
+      ]),
       blocks.divider(),
 
       // Channels
