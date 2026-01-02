@@ -1,11 +1,12 @@
 {
   "name": "instagram-researcher",
-  "version": "1.0.0",
-  "description": "AI-powered Instagram researcher for journaling content",
+  "version": "2.0.0",
+  "description": "AI Agent for Instagram research using Claude Agent SDK",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "npx tsx api/cron/research.ts"
+    "dev": "npx tsx api/cron/research.ts",
+    "agent": "npx tsx api/cron/agent-research.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0"
